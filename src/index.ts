@@ -167,6 +167,15 @@ class LogParser {
                 await this.processScriptLog(scriptLogPath, todayFolder);
             }
 
+            // Force a daily summary update on startup if there are qualifying votes
+            const playersWithVotes = Array.from(this.dailyPlayerMap.values()).filter(player => player.voteYesCount >= 3);
+            if (playersWithVotes.length > 0) {
+                console.log(`[DEBUG] Found ${playersWithVotes.length} players with qualifying votes on startup, forcing daily summary update`);
+                await this.sendDailySummary();
+            } else {
+                console.log('[DEBUG] No qualifying votes found on startup');
+            }
+
             // Set up watchers for both files
             const watchConsole = chokidar.watch(consoleLogPath, {
                 persistent: true,
@@ -296,23 +305,46 @@ class LogParser {
             const fileContent = fs.readFileSync(filePath, 'utf8');
             console.log(`[DEBUG] Processing script log for date: ${folderDate}`);
             console.log(`[DEBUG] File size: ${fileContent.length} bytes`);
-            console.log(`[DEBUG] Before processing - Vote counts per player:`);
-            this.dailyPlayerMap.forEach((player, guid) => {
-                if (player.voteYesCount > 0) {
-                    console.log(`[DEBUG] ${player.name}: ${player.voteYesCount} votes`);
-                }
-            });
 
+            // Extract just the date portion for vote IDs (YYYY-MM-DD)
+            const dateOnly = folderDate.split('_')[0];
+            console.log(`[DEBUG] Using date ${dateOnly} for vote IDs`);
+            
             let votesAdded = false;
             let votesProcessed = 0;
             let duplicateVotes = 0;
             let missingPlayerVotes = 0;
+            let voteLineCount = 0;
+            let currentVoteSession = 0;
+            let currentVoteTarget: string | null = null;
+            let votesInCurrentSession = new Set<string>();
+            let dailyVoteCounts = new Map<string, number>();
 
             // Process each line
             const lines = fileContent.split('\n');
             console.log(`[DEBUG] Processing ${lines.length} lines`);
 
             for (const line of lines) {
+                // Check for vote lines
+                if (line.includes('vote | Vote Type:')) {
+                    voteLineCount++;
+                    const countMatch = line.match(/Count \((\d+)\/(\d+)\)/);
+                    const targetMatch = line.match(/Target: '(\d+)'/);
+                    
+                    if (countMatch && targetMatch) {
+                        const currentCount = parseInt(countMatch[1]);
+                        const targetId = targetMatch[1];
+                        
+                        // If count is 1 or target changes, it's a new vote session
+                        if (currentCount === 1 || targetId !== currentVoteTarget) {
+                            console.log(`[DEBUG] New vote session detected (${currentVoteSession + 1}), Target: ${targetId}`);
+                            currentVoteSession++;
+                            currentVoteTarget = targetId;
+                            votesInCurrentSession = new Set();
+                        }
+                    }
+                }
+
                 if (!line.includes('approved vote | Vote Type: \'KICK\'')) continue;
 
                 const match = line.match(/Player '(\d+)' approved vote \| Vote Type: 'KICK'/);
@@ -320,54 +352,65 @@ class LogParser {
 
                 const [_, playerId] = match;
                 const playerGuid = this.playerIdToGuid.get(playerId);
-                
-                if (playerGuid) {
-                    const timestampMatch = line.match(/^(\d{2}:\d{2}:\d{2})/);
-                    const timestamp = timestampMatch ? timestampMatch[1] : '';
-                    const voteId = `${folderDate}-${timestamp}-${playerId}`;
-                    
-                    console.log(`[DEBUG] Found vote - ID: ${voteId}, PlayerID: ${playerId}, GUID: ${playerGuid}, Line: ${line.substring(0, 100)}`);
-                    
-                    if (!this.processedVotes.has(voteId)) {
-                        const dailyPlayer = this.dailyPlayerMap.get(playerGuid);
-                        
-                        if (dailyPlayer) {
-                            const oldCount = dailyPlayer.voteYesCount;
-                            dailyPlayer.voteYesCount++;
-                            console.log(`[DEBUG] Vote counted - Player: ${dailyPlayer.name}, Old count: ${oldCount}, New count: ${dailyPlayer.voteYesCount}, VoteID: ${voteId}`);
-                            this.dailyPlayerMap.set(playerGuid, dailyPlayer);
-                            votesAdded = true;
-                            votesProcessed++;
-
-                            // Add vote event
-                            const voteEvent: VoteEvent = {
-                                playerId,
-                                playerName: dailyPlayer.name,
-                                timestamp: new Date().toISOString(),
-                                totalVotes: dailyPlayer.voteYesCount,
-                                date: folderDate
-                            };
-                            this.voteEvents.push(voteEvent);
-                        } else {
-                            console.log(`[DEBUG] Player not found in daily map - GUID: ${playerGuid}, ID: ${playerId}`);
-                            missingPlayerVotes++;
-                        }
-                        
-                        this.processedVotes.add(voteId);
-                    } else {
-                        console.log(`[DEBUG] Duplicate vote skipped - VoteID: ${voteId}`);
-                        duplicateVotes++;
-                    }
-                } else {
-                    console.log(`[DEBUG] No GUID found for player ID: ${playerId}`);
+                if (!playerGuid) {
                     missingPlayerVotes++;
+                    continue;
                 }
+
+                // Skip if this player already voted in this session
+                const sessionVoteId = `${currentVoteSession}-${playerId}-${currentVoteTarget}`;
+                if (votesInCurrentSession.has(sessionVoteId)) {
+                    console.log(`[DEBUG] Player ${playerId} already voted in session ${currentVoteSession} for target ${currentVoteTarget}`);
+                    duplicateVotes++;
+                    continue;
+                }
+
+                const dailyPlayer = this.dailyPlayerMap.get(playerGuid);
+                if (!dailyPlayer) {
+                    missingPlayerVotes++;
+                    continue;
+                }
+
+                // Track vote in current session
+                votesInCurrentSession.add(sessionVoteId);
+                votesProcessed++;
+
+                // Update daily vote count
+                const currentCount = dailyVoteCounts.get(playerGuid) || 0;
+                dailyVoteCounts.set(playerGuid, currentCount + 1);
             }
 
+            // After processing all lines, update the vote counts in dailyPlayerMap
+            let votesChanged = false;
+            dailyVoteCounts.forEach((count, guid) => {
+                const player = this.dailyPlayerMap.get(guid);
+                if (player) {
+                    const oldCount = player.voteYesCount;
+                    if (count !== oldCount) {
+                        player.voteYesCount = count;
+                        console.log(`[DEBUG] Updated vote count - Player: ${player.name}, Old count: ${oldCount}, New count: ${count}`);
+                        this.dailyPlayerMap.set(guid, player);
+                        votesChanged = true;
+
+                        // Add vote event
+                        const voteEvent: VoteEvent = {
+                            playerId: player.id,
+                            playerName: player.name,
+                            timestamp: new Date().toISOString(),
+                            totalVotes: count,
+                            date: dateOnly
+                        };
+                        this.voteEvents.push(voteEvent);
+                    }
+                }
+            });
+
             console.log(`[DEBUG] Script log processing complete:`);
+            console.log(`[DEBUG] - Total vote lines found: ${voteLineCount}`);
             console.log(`[DEBUG] - Votes processed: ${votesProcessed}`);
             console.log(`[DEBUG] - Duplicate votes: ${duplicateVotes}`);
             console.log(`[DEBUG] - Missing player votes: ${missingPlayerVotes}`);
+            console.log(`[DEBUG] - Total vote sessions: ${currentVoteSession}`);
             console.log(`[DEBUG] After processing - Vote counts per player:`);
             this.dailyPlayerMap.forEach((player, guid) => {
                 if (player.voteYesCount > 0) {
@@ -375,11 +418,11 @@ class LogParser {
                 }
             });
 
-            if (votesAdded) {
-                console.log(`[DEBUG] New votes added, updating daily summary...`);
+            if (votesChanged) {
+                console.log(`[DEBUG] Vote counts changed, updating daily summary...`);
                 await this.sendDailySummary();
             } else {
-                console.log(`[DEBUG] No new votes added, skipping daily summary update`);
+                console.log(`[DEBUG] No vote count changes, skipping daily summary update`);
             }
         } catch (error) {
             console.error('[DEBUG] Error processing script log:', error);
@@ -456,16 +499,28 @@ class LogParser {
         this.isUpdatingDaily = true;
         try {
             console.log('[DEBUG] Starting daily summary update...');
+            console.log(`[DEBUG] Attempting to fetch channel with ID: ${this.dailyChannelId}`);
+            
             const channel = await this.discordClient.channels.fetch(this.dailyChannelId) as TextChannel;
-            if (!channel || !(channel instanceof TextChannel)) {
-                console.log('[DEBUG] Failed to fetch daily channel');
+            if (!channel) {
+                console.error('[DEBUG] Channel is null - failed to fetch channel');
+                return;
+            }
+            if (!(channel instanceof TextChannel)) {
+                console.error('[DEBUG] Channel is not a TextChannel');
                 return;
             }
 
+            console.log('[DEBUG] Successfully fetched daily channel');
+            console.log(`[DEBUG] Channel name: ${channel.name}`);
+
+            // Prepare player data
             console.log(`[DEBUG] Current daily player map size: ${this.dailyPlayerMap.size}`);
             console.log('[DEBUG] Daily player map contents:');
             this.dailyPlayerMap.forEach((player, guid) => {
-                console.log(`[DEBUG] Player: ${player.name}, GUID: ${guid}, Votes: ${player.voteYesCount}`);
+                if (player.voteYesCount > 0) {
+                    console.log(`[DEBUG] Player: ${player.name}, Votes: ${player.voteYesCount}`);
+                }
             });
 
             const sortedPlayers = Array.from(this.dailyPlayerMap.values())
@@ -475,7 +530,25 @@ class LogParser {
             console.log(`[DEBUG] Found ${sortedPlayers.length} players with 3+ votes`);
 
             if (sortedPlayers.length === 0) {
-                console.log('[DEBUG] No daily votes to display');
+                console.log('[DEBUG] No players with qualifying votes found');
+                // Delete any existing summary messages since there are no qualifying votes
+                const messages = await channel.messages.fetch({ limit: 10 });
+                const existingSummaries = messages.filter(msg => 
+                    msg.author.id === this.discordClient.user?.id && 
+                    msg.content.includes('DAGELIJKS VOTEKICK OVERZICHT')
+                );
+                
+                for (const msg of Array.from(existingSummaries.values())) {
+                    try {
+                        console.log(`[DEBUG] Deleting old summary message ID: ${msg.id}`);
+                        await msg.delete();
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                    } catch (error: any) {
+                        if (error?.code !== 10008) {
+                            console.error(`[DEBUG] Error deleting message ${msg.id}:`, error);
+                        }
+                    }
+                }
                 return;
             }
 
@@ -543,34 +616,56 @@ class LogParser {
             currentPart += `\n📅 Laatst bijgewerkt: ${timestamp}`;
             messageParts.push(currentPart);
 
+            console.log(`[DEBUG] Prepared ${messageParts.length} message parts`);
+            messageParts.forEach((part, index) => {
+                console.log(`[DEBUG] Message part ${index + 1} length: ${part.length} characters`);
+            });
+
             // Get existing messages
+            console.log('[DEBUG] Fetching existing messages...');
             const messages = await channel.messages.fetch({ limit: 10 });
+            console.log(`[DEBUG] Found ${messages.size} messages in channel`);
+
             const existingSummaries = messages.filter(msg => 
                 msg.author.id === this.discordClient.user?.id && 
                 msg.content.includes('DAGELIJKS VOTEKICK OVERZICHT')
             );
+            console.log(`[DEBUG] Found ${existingSummaries.size} existing summary messages`);
 
             // Delete all existing messages first
+            console.log('[DEBUG] Deleting existing summary messages...');
             for (const msg of Array.from(existingSummaries.values())) {
                 try {
+                    console.log(`[DEBUG] Attempting to delete message ID: ${msg.id}`);
                     await msg.delete();
+                    console.log(`[DEBUG] Successfully deleted message ID: ${msg.id}`);
                     await new Promise(resolve => setTimeout(resolve, 1000));
                 } catch (error: any) {
                     if (error?.code !== 10008) {
-                        console.error('Error deleting message:', error);
+                        console.error(`[DEBUG] Error deleting message ${msg.id}:`, error);
                     }
                 }
             }
 
             // Send new messages
-            for (const part of messageParts) {
-                await channel.send(part);
-                await new Promise(resolve => setTimeout(resolve, 1000));
+            console.log('[DEBUG] Sending new summary messages...');
+            for (let i = 0; i < messageParts.length; i++) {
+                const part = messageParts[i];
+                try {
+                    console.log(`[DEBUG] Sending message part ${i + 1}/${messageParts.length}`);
+                    const sent = await channel.send(part);
+                    console.log(`[DEBUG] Successfully sent message ID: ${sent.id}`);
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                } catch (error) {
+                    console.error(`[DEBUG] Error sending message part ${i + 1}:`, error);
+                    throw error; // Re-throw to trigger the error handling
+                }
             }
 
             console.log('[DEBUG] Daily summary update complete');
         } catch (error) {
             console.error('[DEBUG] Error sending daily summary:', error);
+            console.error(error);
         } finally {
             this.isUpdatingDaily = false;
         }
