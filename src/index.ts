@@ -37,6 +37,72 @@ interface ActiveVoteSession {
     lastUpdateTime: number;
 }
 
+// Configuration for customizable messages
+interface MessageConfig {
+    serverTitle: string;
+    dailySummaryTitle: string;
+    historicalSummaryTitle: string;
+    votesText: string;
+    votesTextSingular: string;
+    noVotesToday: string;
+    updatedAt: string;
+    inProgress: string;
+    completed: string;
+    voteSessionStarted: string;
+    startedBy: string;
+    currentVotes: string;
+    lastUpdate: string;
+    voters: string;
+    noneYet: string;
+    voteInProgress: string;
+    voteSessionEnded: string;
+    historicalTimeframe: string;
+}
+
+// Default English configuration
+const DEFAULT_CONFIG: MessageConfig = {
+    serverTitle: "SERVER NAME",
+    dailySummaryTitle: "Daily Votekick Statistics",
+    historicalSummaryTitle: "HISTORICAL VOTEKICK SUMMARY",
+    votesText: "votes",
+    votesTextSingular: "vote",
+    noVotesToday: "No players have votes today.",
+    updatedAt: "Updated at",
+    inProgress: "IN PROGRESS",
+    completed: "COMPLETED",
+    voteSessionStarted: "Vote session started at",
+    startedBy: "Started By",
+    currentVotes: "Current Votes",
+    lastUpdate: "Last Update",
+    voters: "Voters",
+    noneYet: "None yet",
+    voteInProgress: "Vote in progress",
+    voteSessionEnded: "Vote session ended (timed out after 3 minutes of inactivity)",
+    historicalTimeframe: "Last 14 days (5+ votes)"
+};
+
+// Dutch configuration example
+const DUTCH_CONFIG: MessageConfig = {
+    serverTitle: "DUTCH FENIKS",
+    dailySummaryTitle: "Dagelijkse Votekick Statistieken",
+    historicalSummaryTitle: "HISTORISCH VOTEKICK OVERZICHT",
+    votesText: "stemmen",
+    votesTextSingular: "stem",
+    noVotesToday: "Geen spelers hebben stemmen vandaag.",
+    updatedAt: "",
+    inProgress: "IN PROGRESS",
+    completed: "COMPLETED",
+    voteSessionStarted: "Vote session started at",
+    startedBy: "Started By",
+    currentVotes: "Current Votes",
+    lastUpdate: "Last Update",
+    voters: "Voters",
+    noneYet: "None yet",
+    voteInProgress: "Vote in progress",
+    voteSessionEnded: "Vote session ended (timed out after 3 minutes of inactivity)",
+    historicalTimeframe: "Laatste 14 dagen (5+ stemmen)"
+};
+
 class LogParser {
     private playerMap: Map<string, Player> = new Map();
     private dailyPlayerMap: Map<string, Player> = new Map();
@@ -64,6 +130,7 @@ class LogParser {
     private liveVoteMessageIds: Map<number, string> = new Map();
     private activeVoteSessions: Map<number, ActiveVoteSession> = new Map();
     private voteSessionTimeouts: Map<number, NodeJS.Timeout> = new Map();
+    private messageConfig: MessageConfig;
 
     constructor(
         discordToken: string, 
@@ -71,7 +138,8 @@ class LogParser {
         historicalChannelId: string, 
         liveVoteChannelId: string, 
         currentLogDirectory: string,
-        historicalLogDirectory: string = ''
+        historicalLogDirectory: string = '',
+        messageConfig: MessageConfig = DEFAULT_CONFIG
     ) {
         if (process.env.NODE_OPTIONS === undefined) {
             process.env.NODE_OPTIONS = '--max-old-space-size=4096';
@@ -91,6 +159,7 @@ class LogParser {
         this.baseLogDirectory = currentLogDirectory;
         this.historicalLogDirectory = historicalLogDirectory || '';
         this.processedLiveVotes = new Set<string>();
+        this.messageConfig = messageConfig;
         this.setupDiscordClient(discordToken);
         
         this.debugMode = process.env.DEBUG_MODE === 'true';
@@ -837,7 +906,7 @@ class LogParser {
             }
 
             const date = new Date().toLocaleDateString('nl-NL', { weekday: 'long', day: 'numeric', month: 'long' });
-            let message = `📊 **Dagelijkse Votekick Statistieken** 📊\n\n`;
+            let message = `📊 **${this.messageConfig.dailySummaryTitle}** 📊\n\n`;
 
             const sortedPlayers = Array.from(this.dailyPlayerMap.values())
                 .filter(player => player.voteYesCount > 0)
@@ -846,11 +915,12 @@ class LogParser {
             this.debugLog(`Sorted players with votes: ${sortedPlayers.length}`);
 
             if (sortedPlayers.length === 0) {
-                message += 'Geen spelers hebben stemmen vandaag.\n\n';
+                message += `${this.messageConfig.noVotesToday}\n\n`;
             } else {
                 sortedPlayers.forEach((player, index) => {
                     const emoji = index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : '🔹';
-                    message += `${emoji} **${player.name}**: ${player.voteYesCount} stemmen\n`;
+                    const voteText = player.voteYesCount === 1 ? this.messageConfig.votesTextSingular : this.messageConfig.votesText;
+                    message += `${emoji} **${player.name}**: ${player.voteYesCount} ${voteText}\n`;
                 });
                 message += '\n';
             }
@@ -860,7 +930,7 @@ class LogParser {
             const existingMessages = await channel.messages.fetch({ limit: 10 });
             const dailySummaryMessages = existingMessages.filter(msg => 
                 msg.author.id === this.discordClient.user?.id && 
-                msg.content.includes('Dagelijkse Votekick Statistieken')
+                msg.content.includes(this.messageConfig.dailySummaryTitle)
             );
 
             if (dailySummaryMessages.size > 0) {
@@ -988,27 +1058,27 @@ class LogParser {
                 .sort((a, b) => b[0] - a[0]);
 
             const messageParts: string[] = [];
-            let currentPart = '📊 **DUTCH FENIKS - HISTORISCH VOTEKICK OVERZICHT** 📊\n';
-            currentPart += '🗓️ __Laatste 14 dagen (5+ stemmen)__\n\n';
+            let currentPart = `📊 **${this.messageConfig.serverTitle} - ${this.messageConfig.historicalSummaryTitle}** 📊\n`;
+            currentPart += `🗓️ __${this.messageConfig.historicalTimeframe}__\n\n`;
 
             for (const [voteCount, players] of sortedGroups) {
-                const voteText = voteCount === 1 ? 'stem' : 'stemmen';
+                const voteText = voteCount === 1 ? this.messageConfig.votesTextSingular : this.messageConfig.votesText;
                 const line = `\`${voteCount} ${voteText}:\` ${players.join(', ')}\n`;
                 
                 if ((currentPart + line).length > 1900) {
                     messageParts.push(currentPart);
-                    currentPart = '📊 **DUTCH FENIKS - HISTORISCH VOTEKICK OVERZICHT (vervolg)** 📊\n\n';
+                    currentPart = `📊 **${this.messageConfig.serverTitle} - ${this.messageConfig.historicalSummaryTitle} (continued)** 📊\n\n`;
                 }
                 currentPart += line;
             }
 
-            currentPart += `\n📅 Laatst bijgewerkt: ${timestamp}`;
+            currentPart += `\n📅 ${this.messageConfig.updatedAt}: ${timestamp}`;
             messageParts.push(currentPart);
 
             const messages = await channel.messages.fetch({ limit: 10 });
             const existingSummaries = messages.filter(msg => 
                 msg.author.id === this.discordClient.user?.id && 
-                msg.content.includes('HISTORISCH VOTEKICK OVERZICHT')
+                msg.content.includes(this.messageConfig.historicalSummaryTitle)
             );
 
             const existingSummaryArray = Array.from(existingSummaries.values());
@@ -1116,13 +1186,13 @@ class LogParser {
             
             const messageEmbed = new EmbedBuilder()
                 .setColor('#FF0000')
-                .setTitle('⚠️ IN PROGRESS - Vote Session #' + sessionId)
-                .setDescription(`Vote session started at ${timestamp}`)
+                .setTitle(`⚠️ ${this.messageConfig.inProgress} - Vote Session #${sessionId}`)
+                .setDescription(`${this.messageConfig.voteSessionStarted} ${timestamp}`)
                 .addFields(
-                    { name: 'Started By', value: voterName, inline: true },
-                    { name: 'Current Votes', value: '1', inline: true },
-                    { name: 'Last Update', value: new Date().toLocaleTimeString('nl-NL'), inline: true },
-                    { name: 'Voters', value: voterName, inline: false }
+                    { name: this.messageConfig.startedBy, value: voterName, inline: true },
+                    { name: this.messageConfig.currentVotes, value: '1', inline: true },
+                    { name: this.messageConfig.lastUpdate, value: new Date().toLocaleTimeString('nl-NL'), inline: true },
+                    { name: this.messageConfig.voters, value: voterName, inline: false }
                 )
                 .setFooter({ text: 'Will automatically close after 3 minutes of inactivity' })
                 .setTimestamp();
@@ -1156,6 +1226,68 @@ class LogParser {
         }
     }
     
+    private async updateLiveVoteMessage(sessionId: number, session: ActiveVoteSession, isComplete: boolean = false): Promise<void> {
+        try {
+            if (sessionId > this.currentVoteSession + 10) {
+                this.debugLog(`Session ${sessionId} seems too far ahead of current session ${this.currentVoteSession}, skipping update`);
+                return;
+            }
+            
+            const liveVoteChannel = await this.discordClient.channels.fetch(this.liveVoteChannelId);
+            if (!liveVoteChannel || !liveVoteChannel.isTextBased()) {
+                this.debugLog('Failed to get live vote channel for update');
+                return;
+            }
+            
+            if ('messages' in liveVoteChannel) {
+                try {
+                    const message = await liveVoteChannel.messages.fetch(session.messageId);
+                    if (!message) {
+                        this.debugLog(`Cannot find message ${session.messageId} to update`);
+                        return;
+                    }
+                    
+                    const sortedVoters = [...session.voterNames].sort();
+                    
+                    const status = isComplete ? `✅ ${this.messageConfig.completed}` : `⚠️ ${this.messageConfig.inProgress}`;
+                    const color = isComplete ? '#00FF00' : '#FF0000';
+                    
+                    const messageEmbed = new EmbedBuilder()
+                        .setColor(color)
+                        .setTitle(`${status} - Vote Session #${sessionId}`)
+                        .setDescription(`${this.messageConfig.voteSessionStarted} ${session.timestamp}`)
+                        .addFields(
+                            { name: this.messageConfig.startedBy, value: session.startedBy, inline: true },
+                            { name: this.messageConfig.currentVotes, value: `${session.voters.size}`, inline: true },
+                            { name: this.messageConfig.lastUpdate, value: new Date().toLocaleTimeString('nl-NL'), inline: true },
+                            { 
+                                name: this.messageConfig.voters, 
+                                value: sortedVoters.length > 0 
+                                    ? sortedVoters.join('\n') 
+                                    : this.messageConfig.noneYet,
+                                inline: false
+                            }
+                        )
+                        .setFooter({ text: isComplete ? this.messageConfig.voteSessionEnded : this.messageConfig.voteInProgress })
+                        .setTimestamp();
+                    
+                    await message.edit({ embeds: [messageEmbed] });
+                    this.debugLog(`Updated live vote message for session #${sessionId} with ${session.voters.size} voters, complete=${isComplete}`);
+                } catch (error: any) {
+                    if (error.code === 10008) {
+                        this.debugLog(`Message for session #${sessionId} no longer exists, can't update`);
+                        this.liveVoteMessageIds.delete(sessionId);
+                        this.activeVoteSessions.delete(sessionId);
+                    } else {
+                        this.debugLog(`Error updating vote message: ${error}`);
+                    }
+                }
+            }
+        } catch (error) {
+            this.debugLog(`Error in updateLiveVoteMessage: ${error}`);
+        }
+    }
+
     private async updateLiveVoteProgress(targetId: string, currentCount: number, requiredCount: string) {
         console.log(`[DEBUG] Vote progress: ${currentCount}/${requiredCount} for target ${targetId}`);
     }
@@ -1406,68 +1538,6 @@ class LogParser {
             this.debugLog(`Error finalizing vote session: ${error}`);
         }
     }
-    
-    private async updateLiveVoteMessage(sessionId: number, session: ActiveVoteSession, isComplete: boolean = false): Promise<void> {
-        try {
-            if (sessionId > this.currentVoteSession + 10) {
-                this.debugLog(`Session ${sessionId} seems too far ahead of current session ${this.currentVoteSession}, skipping update`);
-                return;
-            }
-            
-            const liveVoteChannel = await this.discordClient.channels.fetch(this.liveVoteChannelId);
-            if (!liveVoteChannel || !liveVoteChannel.isTextBased()) {
-                this.debugLog('Failed to get live vote channel for update');
-                return;
-            }
-            
-            if ('messages' in liveVoteChannel) {
-                try {
-                    const message = await liveVoteChannel.messages.fetch(session.messageId);
-                    if (!message) {
-                        this.debugLog(`Cannot find message ${session.messageId} to update`);
-                        return;
-                    }
-                    
-                    const sortedVoters = [...session.voterNames].sort();
-                    
-                    const status = isComplete ? '✅ COMPLETED' : '⚠️ IN PROGRESS';
-                    const color = isComplete ? '#00FF00' : '#FF0000';
-                    
-                    const messageEmbed = new EmbedBuilder()
-                        .setColor(color)
-                        .setTitle(`${status} - Vote Session #${sessionId}`)
-                        .setDescription(`Vote session started at ${session.timestamp}`)
-                        .addFields(
-                            { name: 'Started By', value: session.startedBy, inline: true },
-                            { name: 'Current Votes', value: `${session.voters.size}`, inline: true },
-                            { name: 'Last Update', value: new Date().toLocaleTimeString('nl-NL'), inline: true },
-                            { 
-                                name: 'Voters', 
-                                value: sortedVoters.length > 0 
-                                    ? sortedVoters.join('\n') 
-                                    : 'None yet',
-                                inline: false
-                            }
-                        )
-                        .setFooter({ text: isComplete ? 'Vote session ended (timed out after 3 minutes of inactivity)' : 'Vote in progress' })
-                        .setTimestamp();
-                    
-                    await message.edit({ embeds: [messageEmbed] });
-                    this.debugLog(`Updated live vote message for session #${sessionId} with ${session.voters.size} voters, complete=${isComplete}`);
-                } catch (error: any) {
-                    if (error.code === 10008) {
-                        this.debugLog(`Message for session #${sessionId} no longer exists, can't update`);
-                        this.liveVoteMessageIds.delete(sessionId);
-                        this.activeVoteSessions.delete(sessionId);
-                    } else {
-                        this.debugLog(`Error updating vote message: ${error}`);
-                    }
-                }
-            }
-        } catch (error) {
-            this.debugLog(`Error in updateLiveVoteMessage: ${error}`);
-        }
-    }
 
     private cleanupMemory(): void {
         try {
@@ -1519,6 +1589,21 @@ const BASE_PATH = process.env.LOG_DIRECTORY || '/srv/armareforger/u4lj4wmjvv';
 const HISTORICAL_LOG_DIRECTORY = `${BASE_PATH}/logs`;
 const CURRENT_LOG_DIRECTORY = `${BASE_PATH}/logs.current`;
 
+// Language configuration
+const LANGUAGE = process.env.LANGUAGE || 'en';  // 'en' for English, 'nl' for Dutch
+
+// Load server title from config.json
+let serverTitle = "SERVER NAME";
+try {
+    const config = JSON.parse(fs.readFileSync('config.json', 'utf8'));
+    if (config.serverTitle) {
+        serverTitle = config.serverTitle;
+    }
+} catch (error) {
+    console.error('Error loading config.json:', error);
+    console.log('Using default server title');
+}
+
 if (!DISCORD_TOKEN || !DAILY_CHANNEL_ID || !HISTORICAL_CHANNEL_ID || !LIVE_VOTE_CHANNEL_ID) {
     console.error('Please set DISCORD_TOKEN, DAILY_CHANNEL_ID, HISTORICAL_CHANNEL_ID, and LIVE_VOTE_CHANNEL_ID environment variables');
     process.exit(1);
@@ -1553,9 +1638,20 @@ async function start() {
         console.log('[INFO] Starting log parser');
         console.log(`[INFO] Using current log directory: ${CURRENT_LOG_DIRECTORY}`);
         console.log(`[INFO] Using historical log directory: ${HISTORICAL_LOG_DIRECTORY}`);
+        console.log(`[INFO] Using language: ${LANGUAGE}`);
+        console.log(`[INFO] Using server title: ${serverTitle}`);
         
         const memoryUsage = process.memoryUsage();
         console.log(`[INFO] Initial memory usage: rss=${Math.round(memoryUsage.rss / 1024 / 1024)}MB, heapTotal=${Math.round(memoryUsage.heapTotal / 1024 / 1024)}MB, heapUsed=${Math.round(memoryUsage.heapUsed / 1024 / 1024)}MB`);
+        
+        // Configure messages based on language
+        let messageConfig = DEFAULT_CONFIG;
+        if (LANGUAGE === 'nl') {
+            messageConfig = DUTCH_CONFIG;
+        }
+        
+        // Set server title from config
+        messageConfig.serverTitle = serverTitle;
         
         const parser = new LogParser(
             DISCORD_TOKEN, 
@@ -1563,7 +1659,8 @@ async function start() {
             HISTORICAL_CHANNEL_ID, 
             LIVE_VOTE_CHANNEL_ID, 
             CURRENT_LOG_DIRECTORY,
-            HISTORICAL_LOG_DIRECTORY
+            HISTORICAL_LOG_DIRECTORY,
+            messageConfig
         );
         
         setInterval(() => {
