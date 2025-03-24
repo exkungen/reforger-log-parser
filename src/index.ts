@@ -25,6 +25,17 @@ interface VoteEvent {
     voterName: string;
     voterId: string;
     voteType: string;
+    sessionId?: number;
+}
+
+// Add a new interface to track active vote sessions
+interface ActiveVoteSession {
+    messageId: string;
+    timestamp: string;
+    startedBy: string;
+    voters: Set<string>;
+    voterNames: string[];
+    lastUpdateTime: number;
 }
 
 class LogParser {
@@ -51,6 +62,9 @@ class LogParser {
     private _lastUpdateTime: number = 0;
     private currentVoteSession: number = 0;
     private debugMode: boolean = true;
+    private liveVoteMessageIds: Map<number, string> = new Map(); // Track message IDs for each session
+    private activeVoteSessions: Map<number, ActiveVoteSession> = new Map(); // Track active vote sessions
+    private voteSessionTimeouts: Map<number, NodeJS.Timeout> = new Map(); // For auto-closing vote sessions
 
     constructor(
         discordToken: string, 
@@ -273,11 +287,17 @@ class LogParser {
             await this.updateHistoricalSummary();
         }, 12 * 60 * 60 * 1000);
 
+        // Run cleanup every 15 minutes to prevent stale sessions
+        setInterval(() => {
+            this.debugLog('[INFO] Running scheduled cleanup of stale vote sessions');
+            this.cleanupOldVoteSessions();
+        }, 15 * 60 * 1000);
+
         // Force daily summary update every hour
         setInterval(async () => {
             console.log('[INFO] Hourly check for daily summary update');
             
-            // Clean up old vote sessions first
+            // Clean up old vote sessions first 
             this.cleanupOldVoteSessions();
             
             // Check if we have any players with votes
@@ -317,8 +337,26 @@ class LogParser {
         this.processedLiveVotes.clear();
         this.voteEvents = [];
         
-        // Reset all session counters to ensure fresh start
-        this.currentVoteSession = 0;
+        // Clear any active timeouts
+        this.voteSessionTimeouts.forEach((timeout) => {
+            clearTimeout(timeout);
+        });
+        this.voteSessionTimeouts.clear();
+        
+        // IMPORTANT: Don't reset session counters or message IDs on restart
+        // This prevents duplicate sessions and messages from being created
+        this.debugLog(`Reset completed - all vote counts and processed sets cleared while preserving session tracking`);
+        
+        // Close any existing active vote sessions
+        for (const [sessionId, session] of this.activeVoteSessions.entries()) {
+            this.debugLog(`Auto-finalizing vote session #${sessionId} on restart`);
+            await this.updateLiveVoteMessage(sessionId, session, true);
+        }
+        
+        // Clear active sessions after finalizing them
+        this.activeVoteSessions.clear();
+        
+        // Reset our last update time
         this._lastUpdateTime = 0;
         
         this.debugLog(`Reset completed - all vote counts, sessions and processed sets cleared`);
@@ -417,7 +455,7 @@ class LogParser {
             const consoleWatcher = chokidar.watch(consoleLogPath, {
                 persistent: true,
                 awaitWriteFinish: {
-                    stabilityThreshold: 500, // Reduced from 2000
+                    stabilityThreshold: 300, // Reduced to be more responsive
                     pollInterval: 100
                 }
             });
@@ -433,7 +471,7 @@ class LogParser {
             const scriptWatcher = chokidar.watch(scriptLogPath, {
                 persistent: true,
                 awaitWriteFinish: {
-                    stabilityThreshold: 500, // Reduced from 2000
+                    stabilityThreshold: 300, // Reduced to be more responsive
                     pollInterval: 100
                 }
             });
@@ -680,120 +718,124 @@ class LogParser {
         
         this.debugLog(`Found ${voteLines.length} valid vote lines to process`);
         
-        // Second pass: process votes and detect sessions
-        let lastProcessedTime = '';
-        let lastCount = 0;
-        let currentSessionId = this.currentVoteSession;
+        // COMPLETELY NEW APPROACH: Group votes by timestamp to identify clusters
+        // This will help us detect when separate vote sessions happen
+        const voteGroups: Map<string, Array<{voterId: string, timestamp: string, count: number, line: string}>> = new Map();
         
-        for (const voteLine of voteLines) {
-            const { voterId, timestamp, count, line } = voteLine;
+        // Group votes by timestamp prefix (first 5 chars - HH:MM)
+        voteLines.forEach(voteLine => {
+            const timePrefix = voteLine.timestamp.substring(0, 5); // Get HH:MM
+            const group = voteGroups.get(timePrefix) || [];
+            group.push(voteLine);
+            voteGroups.set(timePrefix, group);
+        });
+        
+        this.debugLog(`Grouped votes into ${voteGroups.size} time clusters`);
+
+        // Now process each group as a potential vote session
+        let sessionId = this.currentVoteSession;
+        let processedTimestamps = new Set<string>();
+        
+        // Process each time-based group
+        for (const [timePrefix, groupVotes] of voteGroups.entries()) {
+            this.debugLog(`Processing vote group for time ${timePrefix} with ${groupVotes.length} votes`);
             
-            // Create a unique hash for this line to avoid processing duplicates
-            const lineHash = this.hashString(line);
-            if (cachedVoteLines.has(lineHash)) {
-                this.debugLog(`Skipping duplicate line: ${line.substring(0, 50)}...`);
-                duplicateVotes++;
+            // Skip if we've seen this exact time group before
+            const groupKey = `${dateOnly}-${timePrefix}`;
+            if (processedTimestamps.has(groupKey)) {
+                this.debugLog(`Already processed votes for time ${timePrefix}, skipping`);
                 continue;
             }
-            cachedVoteLines.add(lineHash);
             
-            // Check if this is a new vote session
-            let isNewSession = false;
+            processedTimestamps.add(groupKey);
             
-            // If count resets to 1, it's a new session
-            if (count === 1 && lastCount > 1) {
-                isNewSession = true;
-                currentSessionId++;
-                this.debugLog(`New vote session #${currentSessionId} detected (count reset from ${lastCount} to ${count})`);
-            }
-            // If there's a big time gap (>2 minutes) with count 1, it's likely a new session
-            else if (lastProcessedTime !== '' && count === 1) {
-                const lastTime = this.timeToSeconds(lastProcessedTime);
-                const currentTime = this.timeToSeconds(timestamp);
-                const timeDiff = Math.abs(currentTime - lastTime);
+            // Sort votes within group by count
+            groupVotes.sort((a, b) => a.count - b.count);
+            
+            // If this is a new vote session, increment the ID
+            const firstVote = groupVotes[0];
+            if (firstVote && firstVote.count === 1) {
+                sessionId++;
+                this.debugLog(`New vote session #${sessionId} detected at ${firstVote.timestamp}`);
                 
-                if (timeDiff > 120) { // 2 minutes instead of 3
-                    isNewSession = true;
-                    currentSessionId++;
-                    this.debugLog(`New vote session #${currentSessionId} detected (time gap: ${timeDiff} seconds)`);
+                // Initialize the voters set for this session
+                sessionVoterIds.set(sessionId, new Set<string>());
+                
+                // Send notification for new vote session
+                const sessionNotificationId = `session-${dateOnly}-${sessionId}-${timePrefix}`;
+                if (!this.processedLiveVotes.has(sessionNotificationId)) {
+                    // Look up the voter who started the session
+                    const voterGuid = this.playerIdToGuid.get(firstVote.voterId);
+                    if (voterGuid) {
+                        const voterData = this.dailyPlayerMap.get(voterGuid);
+                        if (voterData) {
+                            await this.sendLiveVoteNotification(
+                                'Unknown Player', 
+                                '0',
+                                voterData.name,
+                                firstVote.voterId,
+                                firstVote.timestamp,
+                                dateOnly,
+                                sessionId
+                            );
+                            this.processedLiveVotes.add(sessionNotificationId);
+                        }
+                    }
                 }
-            } 
-            // First vote of processing is always a new session
-            else if (lastProcessedTime === '' && count === 1) {
-                isNewSession = true;
-                currentSessionId++;
-                this.debugLog(`First vote session #${currentSessionId} detected`);
             }
             
-            // Get the set of voters for this session
-            let sessionVoters = sessionVoterIds.get(currentSessionId);
-            if (!sessionVoters) {
-                sessionVoters = new Set<string>();
-                sessionVoterIds.set(currentSessionId, sessionVoters);
-            }
-            
-            // Update tracking variables
-            lastProcessedTime = timestamp;
-            lastCount = count;
-            
-            // Look up the player who voted
-            const voterGuid = this.playerIdToGuid.get(voterId);
-            if (!voterGuid) {
-                this.debugLog(`Cannot find GUID for player ID: ${voterId}, recreating mapping`);
-                // Try to recreate the mapping by processing console log
-                this.processConsoleLogSynchronously(filePath, date);
-                continue;
-            }
-            
-            const voterData = this.dailyPlayerMap.get(voterGuid);
-            if (!voterData) {
-                this.debugLog(`Cannot find player data for GUID: ${voterGuid}`);
-                continue;
-            }
-            
-            // Only count one vote per player per session
-            if (!sessionVoters.has(voterId)) {
-                sessionVoters.add(voterId);
+            // Process all votes in this group
+            for (const vote of groupVotes) {
+                // Get the set of already processed voters for this session
+                const sessionVoters = sessionVoterIds.get(sessionId) || new Set<string>();
+                
+                // Skip if this voter already voted in this session
+                if (sessionVoters.has(vote.voterId)) {
+                    continue;
+                }
+                
+                // Find the voter's player data
+                const voterGuid = this.playerIdToGuid.get(vote.voterId);
+                if (!voterGuid) {
+                    this.debugLog(`Cannot find GUID for player ID: ${vote.voterId}, recreating mapping`);
+                    // Try to recreate the mapping by processing console log
+                    this.processConsoleLogSynchronously(filePath, date);
+                    continue;
+                }
+                
+                const voterData = this.dailyPlayerMap.get(voterGuid);
+                if (!voterData) {
+                    this.debugLog(`Cannot find player data for GUID: ${voterGuid}`);
+                    continue;
+                }
+                
+                // Record this vote
+                sessionVoters.add(vote.voterId);
+                sessionVoterIds.set(sessionId, sessionVoters);
                 voterData.voteYesCount++;
                 votesProcessed++;
-                this.debugLog(`Counting vote for ${voterData.name} in session #${currentSessionId}, new count: ${voterData.voteYesCount}`);
-            } else {
-                this.debugLog(`Player ${voterData.name} already voted in session #${currentSessionId}, not counting again`);
-            }
-            
-            // Add to vote events for tracking
-            this.voteEvents.push({
-                date: dateOnly,
-                timestamp,
-                targetName: 'Unknown',
-                targetId: '0',
-                voterName: voterData.name,
-                voterId,
-                voteType: 'yes'
-            });
-            
-            // Send notification for new sessions, but only if we haven't sent one for this session before
-            if (isNewSession && count === 1) {
-                const sessionNotificationId = `session-${dateOnly}-${currentSessionId}`;
-                if (!this.processedLiveVotes.has(sessionNotificationId)) {
-                    await this.sendLiveVoteNotification(
-                        'Unknown Player', 
-                        '0',
-                        voterData.name,
-                        voterId,
-                        timestamp,
-                        dateOnly,
-                        currentSessionId
-                    );
-                    this.processedLiveVotes.add(sessionNotificationId);
-                } else {
-                    this.debugLog(`Already sent notification for session #${currentSessionId}, skipping`);
-                }
+                
+                this.debugLog(`Counting vote for ${voterData.name} in session #${sessionId}, new count: ${voterData.voteYesCount}`);
+                
+                // Add to vote events for tracking
+                this.voteEvents.push({
+                    date: dateOnly,
+                    timestamp: vote.timestamp,
+                    targetName: 'Unknown',
+                    targetId: '0',
+                    voterName: voterData.name,
+                    voterId: vote.voterId,
+                    voteType: 'yes',
+                    sessionId: sessionId
+                });
+                
+                // Update the active vote session with this voter
+                await this.updateActiveVoteSession(sessionId, voterData.name, vote.timestamp, dateOnly);
             }
         }
-        
-        // Update the current session counter
-        this.currentVoteSession = currentSessionId;
+
+        // Update our current session counter
+        this.currentVoteSession = Math.max(this.currentVoteSession, sessionId);
         
         // Log summary
         this.debugLog(`Script log processing complete:`);
@@ -1178,18 +1220,32 @@ class LogParser {
         sessionId: number
     ) {
         try {
-            // Create a unique identifier for this vote session
+            // Create unique identifiers for this vote session
             const sessionNotificationId = `session-${dateOnly}-${sessionId}`;
+            const sessionTimestampId = `session-${dateOnly}-${timestamp.substring(0, 5)}`; // HH:MM
             
-            // Skip if we've already sent a notification for this session
+            // Skip if we've already sent a notification for this session or for this timestamp
             if (this.processedLiveVotes.has(sessionNotificationId)) {
                 this.debugLog(`Already sent live notification for session ${sessionNotificationId}, skipping`);
                 return;
             }
             
-            // Validate that session number is within a reasonable range
-            if (sessionId < 1 || sessionId > 5000) {
-                this.debugLog(`Suspicious session number ${sessionId}, not sending notification`);
+            // Check if we've already sent a notification for a session with this timestamp
+            // This helps prevent duplicate session notifications for the same voting event
+            if (this.processedLiveVotes.has(sessionTimestampId)) {
+                this.debugLog(`Already sent notification for a session at time ${timestamp.substring(0, 5)}, skipping new session #${sessionId}`);
+                return;
+            }
+            
+            // Skip if this session ID is suspiciously high
+            if (sessionId <= 0 || sessionId > 100) {
+                this.debugLog(`Session #${sessionId} appears to be out of valid range, skipping notification`);
+                return;
+            }
+            
+            // Skip if a message ID for this session already exists (shouldn't happen, but just in case)
+            if (this.liveVoteMessageIds.has(sessionId)) {
+                this.debugLog(`Message ID already exists for session #${sessionId}, not sending duplicate notification`);
                 return;
             }
             
@@ -1211,24 +1267,46 @@ class LogParser {
                 return;
             }
             
-            // Send a generic notification about a new vote session starting without specifying the player
+            // Create initial embed with the first voter
             const messageEmbed = new EmbedBuilder()
                 .setColor('#FF0000')
-                .setTitle('⚠️ Vote Session Started ⚠️')
-                .setDescription(`New vote session #${sessionId} started at ${timestamp}`)
+                .setTitle('⚠️ IN PROGRESS - Vote Session #' + sessionId)
+                .setDescription(`Vote session started at ${timestamp}`)
                 .addFields(
-                    { name: 'First Vote By', value: voterName, inline: true },
-                    { name: 'Server Time', value: timestamp, inline: true },
+                    { name: 'Started By', value: voterName, inline: true },
+                    { name: 'Current Votes', value: '1', inline: true },
+                    { name: 'Last Update', value: new Date().toLocaleTimeString('nl-NL'), inline: true },
+                    { name: 'Voters', value: voterName, inline: false }
                 )
+                .setFooter({ text: 'Will automatically close after 3 minutes of inactivity' })
                 .setTimestamp();
             
             // Cast the channel to TextChannel to use the send method
             if ('send' in liveVoteChannel) {
-                await liveVoteChannel.send({ embeds: [messageEmbed] });
-                this.debugLog(`Sent live vote notification for session ${sessionNotificationId}`);
+                const sentMessage = await liveVoteChannel.send({ embeds: [messageEmbed] });
+                this.debugLog(`Sent live vote notification for session ${sessionNotificationId} with message ID ${sentMessage.id}`);
                 
                 // Mark this session as having sent a notification
                 this.processedLiveVotes.add(sessionNotificationId);
+                this.processedLiveVotes.add(sessionTimestampId); // Also mark the timestamp as processed
+                
+                // Store the message ID for this session for future updates
+                this.liveVoteMessageIds.set(sessionId, sentMessage.id);
+                
+                // Create an active vote session tracking object
+                const session: ActiveVoteSession = {
+                    messageId: sentMessage.id,
+                    timestamp,
+                    startedBy: voterName,
+                    voters: new Set([voterName]),
+                    voterNames: [voterName],
+                    lastUpdateTime: Date.now()
+                };
+                
+                this.activeVoteSessions.set(sessionId, session);
+                
+                // Set a timeout to mark this session as complete after inactivity
+                this.setVoteSessionTimeout(sessionId, dateOnly);
             } else {
                 this.debugLog('Live vote channel does not support sending messages');
             }
@@ -1292,8 +1370,13 @@ class LogParser {
         // Clean up processedLiveVotes
         const liveVotesToRemove: string[] = [];
         this.processedLiveVotes.forEach(voteId => {
-            const datePart = voteId.split('-')[0];
-            if (datePart !== currentDateStr) {
+            // Keep only current day's votes
+            if (voteId.includes('-') && !voteId.includes(currentDateStr)) {
+                liveVotesToRemove.push(voteId);
+            }
+            
+            // Also remove any stale session keys that are more than 3 hours old
+            if (voteId.startsWith('session-') && !voteId.includes(currentDateStr)) {
                 liveVotesToRemove.push(voteId);
             }
         });
@@ -1301,6 +1384,59 @@ class LogParser {
         if (liveVotesToRemove.length > 0) {
             this.debugLog(`Cleaning up ${liveVotesToRemove.length} old processed live votes`);
             liveVotesToRemove.forEach(voteId => this.processedLiveVotes.delete(voteId));
+        }
+        
+        // Clean up active vote sessions - much more aggressively now
+        const sessionsToRemove: number[] = [];
+        const currentTime = Date.now();
+        
+        this.activeVoteSessions.forEach((session, sessionId) => {
+            // Clean up sessions with no updates in the last hour
+            const timeSinceUpdate = currentTime - session.lastUpdateTime;
+            if (timeSinceUpdate > 60 * 60 * 1000) {
+                this.debugLog(`Cleaning up stale vote session #${sessionId} - no updates in ${Math.round(timeSinceUpdate/1000/60)} minutes`);
+                sessionsToRemove.push(sessionId);
+            }
+            
+            // Also clean up sessions with suspiciously high IDs (likely errors)
+            if (sessionId > 100) {
+                this.debugLog(`Cleaning up suspicious vote session #${sessionId} - ID too high`);
+                sessionsToRemove.push(sessionId);
+            }
+        });
+        
+        // Finalize all sessions that need to be removed
+        sessionsToRemove.forEach(async (sessionId) => {
+            const session = this.activeVoteSessions.get(sessionId);
+            if (session) {
+                try {
+                    // Try to update the message one last time to mark as complete
+                    await this.updateLiveVoteMessage(sessionId, session, true);
+                } catch (error) {
+                    this.debugLog(`Error finalizing vote session #${sessionId}: ${error}`);
+                }
+                
+                // Clean up
+                this.activeVoteSessions.delete(sessionId);
+                this.liveVoteMessageIds.delete(sessionId);
+                
+                // Clear any timeouts
+                const timeout = this.voteSessionTimeouts.get(sessionId);
+                if (timeout) {
+                    clearTimeout(timeout);
+                    this.voteSessionTimeouts.delete(sessionId);
+                }
+            }
+        });
+        
+        if (sessionsToRemove.length > 0) {
+            this.debugLog(`Cleaned up ${sessionsToRemove.length} old active vote sessions`);
+        }
+        
+        // Reset current session ID if it's gotten too high
+        if (this.currentVoteSession > 100) {
+            this.debugLog(`Resetting currentVoteSession from ${this.currentVoteSession} to 0 as it's gotten too high`);
+            this.currentVoteSession = 0;
         }
     }
 
@@ -1352,6 +1488,191 @@ class LogParser {
             
         } catch (error) {
             this.debugLog(`Error in synchronous console log processing: ${error}`);
+        }
+    }
+
+    // Add new method to update active vote sessions
+    private async updateActiveVoteSession(sessionId: number, voterName: string, timestamp: string, dateStr: string): Promise<void> {
+        try {
+            // Skip if the session ID is too high (likely an error)
+            if (sessionId <= 0 || sessionId > 1000) {
+                this.debugLog(`Skipping update for suspicious session ID: ${sessionId}`);
+                return;
+            }
+            
+            // Check if this session has been finalized already
+            const finalizedKey = `finalized-${dateStr}-${sessionId}`;
+            if (this.processedLiveVotes.has(finalizedKey)) {
+                this.debugLog(`Session #${sessionId} has already been finalized, skipping update`);
+                return;
+            }
+            
+            // Check if we're tracking this session
+            let session = this.activeVoteSessions.get(sessionId);
+            const sessionKey = `session-${dateStr}-${sessionId}`;
+            
+            if (!session) {
+                // If no active session yet but we have a message ID, create a new tracked session
+                const messageId = this.liveVoteMessageIds.get(sessionId);
+                if (!messageId) {
+                    // No message ID yet - this can happen if processScriptLog detects a new session
+                    // but hasn't sent the notification yet. Let's skip this update.
+                    this.debugLog(`No message ID found for session #${sessionId}, skipping update`);
+                    return;
+                }
+                
+                session = {
+                    messageId,
+                    timestamp,
+                    startedBy: voterName,
+                    voters: new Set([voterName]),
+                    voterNames: [voterName],
+                    lastUpdateTime: Date.now()
+                };
+                this.activeVoteSessions.set(sessionId, session);
+                
+                // Set a timeout to mark this session as complete after inactivity
+                this.setVoteSessionTimeout(sessionId, dateStr);
+                
+                this.debugLog(`Created new active vote session tracking for #${sessionId}`);
+                
+                // Update the message right away
+                await this.updateLiveVoteMessage(sessionId, session);
+            } else {
+                // Update existing session with this new voter
+                if (!session.voters.has(voterName)) {
+                    session.voters.add(voterName);
+                    session.voterNames.push(voterName);
+                    session.lastUpdateTime = Date.now();
+                    this.activeVoteSessions.set(sessionId, session);
+                    
+                    // Update the message with the new voter list
+                    await this.updateLiveVoteMessage(sessionId, session);
+                    
+                    // Reset the timeout since there's new activity
+                    this.setVoteSessionTimeout(sessionId, dateStr);
+                    
+                    this.debugLog(`Updated active vote session #${sessionId} with new voter: ${voterName}`);
+                } else {
+                    this.debugLog(`Voter ${voterName} already in session #${sessionId}, not updating`);
+                }
+            }
+        } catch (error) {
+            this.debugLog(`Error updating active vote session: ${error}`);
+        }
+    }
+    
+    // Set a timeout to close a vote session after inactivity
+    private setVoteSessionTimeout(sessionId: number, dateStr: string): void {
+        // Clear any existing timeout
+        const existingTimeout = this.voteSessionTimeouts.get(sessionId);
+        if (existingTimeout) {
+            clearTimeout(existingTimeout);
+        }
+        
+        // Set new timeout - 3 minutes of inactivity (reduced from 5) before considering the vote complete
+        const timeout = setTimeout(async () => {
+            await this.finalizeVoteSession(sessionId, dateStr);
+        }, 3 * 60 * 1000);
+        
+        this.voteSessionTimeouts.set(sessionId, timeout);
+        this.debugLog(`Set timeout for vote session #${sessionId} to finalize after 3 minutes of inactivity`);
+    }
+    
+    // Finalize a vote session after timeout
+    private async finalizeVoteSession(sessionId: number, dateStr: string): Promise<void> {
+        try {
+            const session = this.activeVoteSessions.get(sessionId);
+            if (!session) {
+                this.debugLog(`No active session found for #${sessionId}, cannot finalize`);
+                return;
+            }
+            
+            this.debugLog(`Finalizing vote session #${sessionId} after timeout`);
+            
+            // Update the message one last time with completed status
+            await this.updateLiveVoteMessage(sessionId, session, true);
+            
+            // Clean up
+            this.activeVoteSessions.delete(sessionId);
+            this.voteSessionTimeouts.delete(sessionId);
+            
+            // Mark the session as fully processed to prevent resurrection
+            const sessionKey = `finalized-${dateStr}-${sessionId}`;
+            this.processedLiveVotes.add(sessionKey);
+            
+            this.debugLog(`Vote session #${sessionId} successfully finalized and marked as completed`);
+        } catch (error) {
+            this.debugLog(`Error finalizing vote session: ${error}`);
+        }
+    }
+    
+    // Update the live vote message with current information
+    private async updateLiveVoteMessage(sessionId: number, session: ActiveVoteSession, isComplete: boolean = false): Promise<void> {
+        try {
+            // Skip if this is beyond our active session limit
+            if (sessionId > this.currentVoteSession + 10) {
+                this.debugLog(`Session ${sessionId} seems too far ahead of current session ${this.currentVoteSession}, skipping update`);
+                return;
+            }
+            
+            const liveVoteChannel = await this.discordClient.channels.fetch(this.liveVoteChannelId);
+            if (!liveVoteChannel || !liveVoteChannel.isTextBased()) {
+                this.debugLog('Failed to get live vote channel for update');
+                return;
+            }
+            
+            // Try to fetch the message
+            if ('messages' in liveVoteChannel) {
+                try {
+                    const message = await liveVoteChannel.messages.fetch(session.messageId);
+                    if (!message) {
+                        this.debugLog(`Cannot find message ${session.messageId} to update`);
+                        return;
+                    }
+                    
+                    // Sort voters alphabetically for consistent display
+                    const sortedVoters = [...session.voterNames].sort();
+                    
+                    // Create updated embed
+                    const status = isComplete ? '✅ COMPLETED' : '⚠️ IN PROGRESS';
+                    const color = isComplete ? '#00FF00' : '#FF0000';
+                    
+                    const messageEmbed = new EmbedBuilder()
+                        .setColor(color)
+                        .setTitle(`${status} - Vote Session #${sessionId}`)
+                        .setDescription(`Vote session started at ${session.timestamp}`)
+                        .addFields(
+                            { name: 'Started By', value: session.startedBy, inline: true },
+                            { name: 'Current Votes', value: `${session.voters.size}`, inline: true },
+                            { name: 'Last Update', value: new Date().toLocaleTimeString('nl-NL'), inline: true },
+                            { 
+                                name: 'Voters', 
+                                value: sortedVoters.length > 0 
+                                    ? sortedVoters.join('\n') 
+                                    : 'None yet',
+                                inline: false
+                            }
+                        )
+                        .setFooter({ text: isComplete ? 'Vote session ended (timed out after 3 minutes of inactivity)' : 'Vote in progress' })
+                        .setTimestamp();
+                    
+                    // Update the message
+                    await message.edit({ embeds: [messageEmbed] });
+                    this.debugLog(`Updated live vote message for session #${sessionId} with ${session.voters.size} voters, complete=${isComplete}`);
+                } catch (error: any) {
+                    if (error.code === 10008) { // Unknown message error
+                        this.debugLog(`Message for session #${sessionId} no longer exists, can't update`);
+                        // Remove from tracking
+                        this.liveVoteMessageIds.delete(sessionId);
+                        this.activeVoteSessions.delete(sessionId);
+                    } else {
+                        this.debugLog(`Error updating vote message: ${error}`);
+                    }
+                }
+            }
+        } catch (error) {
+            this.debugLog(`Error in updateLiveVoteMessage: ${error}`);
         }
     }
 }
